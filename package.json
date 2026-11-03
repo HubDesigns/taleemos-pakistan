@@ -1,0 +1,39 @@
+{
+  "name": "taleemos-pakistan",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TaleemOS Pakistan - multi-tenant education management SaaS",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bootstrap:superadmin": "tsx scripts/bootstrap-superadmin.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
+  },
+  "dependencies": {
+    "argon2": "0.45.1",
+    "dotenv": "^18.0.9",
+    "drizzle-orm": "^0.45.4",
+    "next": "16.4.3",
+    "pg": "^8.23.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "drizzle-kit": "^0.31.11",
+    "tailwindcss": "4.3.3",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.0",
+    "vitest": "5.0.5"
+  }
+}
