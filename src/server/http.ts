@@ -2,6 +2,7 @@ import { cookies, headers } from "next/headers";
 import { ZodError } from "zod";
 import { db } from "@/db/client";
 import { ForbiddenError, type Actor } from "@/lib/rbac";
+import { BillingError } from "./billing";
 import { PasswordChangeError, resolveSession, type RequestMeta } from "./auth";
 import { SubscriptionInactiveError } from "./subscription-guard";
 import { DuplicateError } from "./tenant";
@@ -47,6 +48,7 @@ export function errorResponse(e: unknown): Response {
   if (e instanceof ForbiddenError) return Response.json({ error: "You do not have permission to do this" }, { status: 403 });
   if (e instanceof SubscriptionInactiveError) return Response.json({ error: "This institute's subscription is not active" }, { status: 402 });
   if (e instanceof DuplicateError) return Response.json({ error: e.message }, { status: 409 });
+  if (e instanceof BillingError) return Response.json({ error: e.message }, { status: 400 });
   if (e instanceof PasswordChangeError) return Response.json({ error: e.message }, { status: 400 });
   // Never leak stack traces or database details; log a short server-side line instead.
   console.error("Unhandled API error:", e instanceof Error ? e.name : "unknown");

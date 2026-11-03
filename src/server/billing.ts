@@ -1,4 +1,4 @@
-import { and, desc, eq, ne, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import { schema, type Db, type Tx } from "@/db/client";
 import { parseRupees } from "@/lib/money";
@@ -8,7 +8,7 @@ import type { RequestMeta } from "./auth";
 import { isUniqueViolation } from "./errors";
 import { DuplicateError } from "./tenant";
 
-const { subscriptions, subscriptionPlans, subscriptionPayments, paymentReceipts, auditLogs } = schema;
+const { subscriptions, subscriptionPlans, subscriptionPayments, paymentReceipts, auditLogs, institutions } = schema;
 
 export class BillingError extends Error {
   constructor(message: string) {
@@ -19,6 +19,15 @@ export class BillingError extends Error {
 
 const toDecimal = (paisa: bigint) => `${paisa / 100n}.${(paisa % 100n).toString().padStart(2, "0")}`;
 const RECEIPT_LOCK = 727001;
+
+/** parseRupees throws a plain Error; surface it to users as a validation error, not a 500. */
+function amountOrThrow(input: string, what: string): bigint {
+  try {
+    return parseRupees(input);
+  } catch {
+    throw new BillingError(`${what} must be a positive number with at most 2 decimals`);
+  }
+}
 
 // ---------------------------------------------------------------- plans
 const planInput = z.object({
@@ -38,7 +47,7 @@ export async function createPlan(db: Db, actor: Actor, raw: unknown) {
   if ((input.interval === "TRIAL" || input.interval === "CUSTOM") && !input.durationDays) {
     throw new BillingError("durationDays is required for TRIAL and CUSTOM plans");
   }
-  const price = parseRupees(input.price);
+  const price = amountOrThrow(input.price, "Price");
   const [plan] = await db.transaction(async (tx) => {
     const rows = await tx.insert(subscriptionPlans).values({
       code: input.code, name: input.name, interval: input.interval, durationDays: input.durationDays ?? null,
@@ -79,7 +88,7 @@ async function lockLatestSubscription(tx: Tx, institutionId: string) {
 export async function recordPayment(db: Db, actor: Actor, raw: unknown, meta: RequestMeta = {}, now: Date = new Date()) {
   requirePermission(actor, "subscriptions:manage");
   const input = recordInput.parse(raw);
-  const paisa = parseRupees(input.amount);
+  const paisa = amountOrThrow(input.amount, "Amount");
   if (paisa <= 0n) throw new BillingError("Amount must be greater than zero");
 
   return db.transaction(async (tx) => {
@@ -94,6 +103,7 @@ export async function recordPayment(db: Db, actor: Actor, raw: unknown, meta: Re
 
     const [plan] = await tx.select().from(subscriptionPlans).where(eq(subscriptionPlans.id, input.planId)).limit(1);
     if (!plan || !plan.isActive) throw new BillingError("Plan not found or inactive");
+    if (plan.interval === "TRIAL") throw new BillingError("Trial plans cannot be purchased");
 
     if (input.transactionRef) {
       const [dupe] = await tx.select({ id: subscriptionPayments.id }).from(subscriptionPayments).where(and(
@@ -187,4 +197,63 @@ export async function listPayments(db: Db, actor: Actor, institutionId: string) 
   return db.select({ payment: subscriptionPayments, receiptNumber: paymentReceipts.receiptNumber })
     .from(subscriptionPayments).leftJoin(paymentReceipts, eq(paymentReceipts.paymentId, subscriptionPayments.id))
     .where(eq(subscriptionPayments.institutionId, institutionId)).orderBy(desc(subscriptionPayments.createdAt));
+}
+
+// ---------------------------------------------------------------- read models for the Super Admin screens
+export async function listPlans(db: Db, actor: Actor) {
+  requirePermission(actor, "subscriptions:manage");
+  return db.select().from(subscriptionPlans)
+    .where(and(eq(subscriptionPlans.isActive, true), ne(subscriptionPlans.interval, "TRIAL"))).orderBy(subscriptionPlans.price);
+}
+
+export async function listRecentPayments(db: Db, actor: Actor, limit = 25) {
+  requirePermission(actor, "subscriptions:manage");
+  return db.select({
+    payment: subscriptionPayments, institutionName: institutions.name, institutionSlug: institutions.slug,
+    planName: subscriptionPlans.name, receiptNumber: paymentReceipts.receiptNumber,
+  }).from(subscriptionPayments)
+    .innerJoin(institutions, eq(institutions.id, subscriptionPayments.institutionId))
+    .innerJoin(subscriptionPlans, eq(subscriptionPlans.id, subscriptionPayments.planId))
+    .leftJoin(paymentReceipts, eq(paymentReceipts.paymentId, subscriptionPayments.id))
+    .orderBy(desc(subscriptionPayments.createdAt)).limit(Math.min(Math.max(limit, 1), 100));
+}
+
+/** Receipt data exists only for verified payments. */
+export async function getReceipt(db: Db, actor: Actor, paymentId: string) {
+  requirePermission(actor, "subscriptions:manage");
+  const [row] = await db.select({
+    payment: subscriptionPayments, receipt: paymentReceipts, institution: institutions, plan: subscriptionPlans,
+  }).from(paymentReceipts)
+    .innerJoin(subscriptionPayments, eq(paymentReceipts.paymentId, subscriptionPayments.id))
+    .innerJoin(institutions, eq(institutions.id, subscriptionPayments.institutionId))
+    .innerJoin(subscriptionPlans, eq(subscriptionPlans.id, subscriptionPayments.planId))
+    .where(eq(subscriptionPayments.id, paymentId)).limit(1);
+  return row ?? null;
+}
+
+const MONTHS: Record<string, number> = { MONTHLY: 1, QUARTERLY: 3, SIX_MONTH: 6, ANNUAL: 12 };
+
+/** Money figures for the dashboard. MRR/ARR are estimates from plan list prices of currently paid, unexpired subscriptions. */
+export async function revenueSummary(db: Db, actor: Actor, now: Date = new Date()) {
+  requirePermission(actor, "subscriptions:manage");
+  const [t] = await db.select({
+    verifiedTotal: sql<string>`coalesce(sum(${subscriptionPayments.amount}) filter (where ${subscriptionPayments.verification} = 'VERIFIED'), 0)::text`,
+    pendingTotal: sql<string>`coalesce(sum(${subscriptionPayments.amount}) filter (where ${subscriptionPayments.verification} = 'PENDING'), 0)::text`,
+    pendingCount: sql<number>`(count(*) filter (where ${subscriptionPayments.verification} = 'PENDING'))::int`,
+  }).from(subscriptionPayments);
+
+  const paid = await db.select({ price: subscriptionPlans.price, interval: subscriptionPlans.interval, days: subscriptionPlans.durationDays })
+    .from(subscriptions).innerJoin(subscriptionPlans, eq(subscriptionPlans.id, subscriptions.planId))
+    .where(and(inArray(subscriptions.status, ["ACTIVE", "EXPIRING_SOON"]), gt(subscriptions.expiresAt, now)));
+  let mrr = 0n;
+  for (const p of paid) {
+    const price = parseRupees(p.price);
+    const months = MONTHS[p.interval];
+    if (months) mrr += price / BigInt(months);
+    else if (p.interval === "CUSTOM" && p.days) mrr += (price * 30n) / BigInt(p.days);
+  }
+  return {
+    verifiedTotal: t?.verifiedTotal ?? "0", pendingTotal: t?.pendingTotal ?? "0", pendingCount: t?.pendingCount ?? 0,
+    mrr: toDecimal(mrr), arr: toDecimal(mrr * 12n),
+  };
 }

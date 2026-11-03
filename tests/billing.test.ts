@@ -2,7 +2,9 @@ import { eq } from "drizzle-orm";
 import { beforeEach, describe, expect, it } from "vitest";
 import { db, schema } from "@/db/client";
 import { ForbiddenError, type Actor } from "@/lib/rbac";
-import { BillingError, createPlan, listPayments, recordPayment, rejectPayment, verifyPayment } from "@/server/billing";
+import {
+  BillingError, createPlan, getReceipt, listPayments, listPlans, listRecentPayments, recordPayment, rejectPayment, revenueSummary, verifyPayment,
+} from "@/server/billing";
 import { DuplicateError } from "@/server/tenant";
 import { makeInstitution, makeSuperAdmin, resetDb } from "./helpers";
 
@@ -55,8 +57,9 @@ describe("recording payments", () => {
 
   it("rejects bad amounts, inactive plans and reused transaction references", async () => {
     for (const amount of ["0", "0.00", "-5", "12.345", "abc"]) {
-      await expect(recordPayment(db, sa, pay({ amount }), {}, NOW)).rejects.toThrow();
+      await expect(recordPayment(db, sa, pay({ amount }), {}, NOW)).rejects.toBeInstanceOf(BillingError);
     }
+    await expect(createPlan(db, sa, { code: "BAD-PRICE", name: "Bad", interval: "MONTHLY", price: "1.999" })).rejects.toBeInstanceOf(BillingError);
     await db.update(schema.subscriptionPlans).set({ isActive: false }).where(eq(schema.subscriptionPlans.id, planId));
     await expect(recordPayment(db, sa, pay(), {}, NOW)).rejects.toBeInstanceOf(BillingError);
     await db.update(schema.subscriptionPlans).set({ isActive: true }).where(eq(schema.subscriptionPlans.id, planId));
@@ -154,5 +157,45 @@ describe("plans", () => {
     const ok = await createPlan(db, sa, { code: "CUSTOM-1", name: "Custom", interval: "CUSTOM", durationDays: 45, price: "9999.50" });
     expect(ok.price).toBe("9999.50");
     await expect(createPlan(db, sa, { code: "custom-1", name: "Again", interval: "MONTHLY", price: "1" })).rejects.toBeInstanceOf(DuplicateError);
+  });
+});
+
+describe("read models for the Super Admin screens", () => {
+  it("trial plans cannot be purchased or listed", async () => {
+    const trial = await createPlan(db, sa, { code: "TRIAL-X", name: "Trial", interval: "TRIAL", durationDays: 14, price: "0" });
+    await expect(recordPayment(db, sa, pay({ planId: trial.id }), {}, NOW)).rejects.toThrow("Trial plans cannot be purchased");
+    expect((await listPlans(db, sa)).map((p) => p.code)).toEqual(["MONTHLY-5000"]);
+  });
+
+  it("receipts exist only for verified payments, and only operators can read them", async () => {
+    const { payment } = await recordPayment(db, sa, pay(), {}, NOW);
+    expect(await getReceipt(db, sa, payment.id)).toBeNull();
+    const v = await verifyPayment(db, sa, payment.id, {}, NOW);
+    const r = await getReceipt(db, sa, payment.id);
+    expect(r?.receipt.receiptNumber).toBe(v.receipt.receiptNumber);
+    expect(r?.institution.slug).toBe("alpha");
+    await expect(getReceipt(db, inst.owner, payment.id)).rejects.toBeInstanceOf(ForbiddenError);
+    await expect(listRecentPayments(db, inst.owner)).rejects.toBeInstanceOf(ForbiddenError);
+    const recent = await listRecentPayments(db, sa);
+    expect(recent[0]).toMatchObject({ institutionSlug: "alpha", planName: "Monthly", receiptNumber: v.receipt.receiptNumber });
+  });
+
+  it("revenue figures separate verified money from pending and estimate MRR/ARR", async () => {
+    const annual = await createPlan(db, sa, { code: "ANNUAL-60K", name: "Annual", interval: "ANNUAL", price: "60000" });
+    expect(await revenueSummary(db, sa, NOW)).toMatchObject({ verifiedTotal: "0", pendingCount: 0, mrr: "0.00" });
+
+    const p1 = await recordPayment(db, sa, pay(), {}, NOW);
+    await recordPayment(db, sa, pay({ amount: "1200.50" }), {}, NOW); // stays pending
+    await verifyPayment(db, sa, p1.payment.id, {}, NOW);
+    let r = await revenueSummary(db, sa, NOW);
+    expect(r).toMatchObject({ verifiedTotal: "5000.00", pendingTotal: "1200.50", pendingCount: 1, mrr: "5000.00", arr: "60000.00" });
+
+    const other = await makeInstitution(sa, "beta");
+    await db.update(schema.subscriptions).set({ expiresAt: EXPIRY }).where(eq(schema.subscriptions.institutionId, other.institution.id));
+    const p2 = await recordPayment(db, sa, pay({ institutionId: other.institution.id, planId: annual.id, amount: "60000" }), {}, NOW);
+    await verifyPayment(db, sa, p2.payment.id, {}, NOW);
+    r = await revenueSummary(db, sa, NOW);
+    expect(r).toMatchObject({ verifiedTotal: "65000.00", mrr: "10000.00", arr: "120000.00" });
+    await expect(revenueSummary(db, inst.owner, NOW)).rejects.toBeInstanceOf(ForbiddenError);
   });
 });

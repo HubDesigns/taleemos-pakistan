@@ -4,7 +4,9 @@ import { can } from "@/lib/rbac";
 import { mustChangePassword } from "@/server/auth";
 import { getActor } from "@/server/http";
 import { platformStats } from "@/server/institutions";
-import { LogoutButton } from "@/components/ui";
+import { AdminHeader } from "./header";
+import { pkr } from "@/lib/format";
+import { revenueSummary } from "@/server/billing";
 import { RegisterInstitutionForm } from "./register-form";
 
 export const dynamic = "force-dynamic";
@@ -21,7 +23,7 @@ export default async function AdminPage() {
   if (actor.scope !== "PLATFORM" || !can(actor, "institutions:read")) redirect("/app");
   if (await mustChangePassword(db, actor.userId)) redirect("/change-password");
 
-  const s = await platformStats(db, actor);
+  const [s, rev] = await Promise.all([platformStats(db, actor), revenueSummary(db, actor)]);
   const cards = [
     ["Registered institutes", s.totalInstitutions],
     ["Active institutes", s.activeInstitutions],
@@ -34,12 +36,7 @@ export default async function AdminPage() {
 
   return (
     <div>
-      <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-3">
-          <span className="font-semibold text-brand-700">TaleemOS <span className="text-slate-500">Super Admin</span></span>
-          <LogoutButton />
-        </div>
-      </header>
+      <AdminHeader current="dashboard" />
       <main className="mx-auto max-w-6xl space-y-8 px-6 py-8">
         <section aria-label="Platform summary" className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {cards.map(([label, value]) => (
@@ -49,7 +46,20 @@ export default async function AdminPage() {
             </div>
           ))}
         </section>
-        <p className="text-xs text-slate-500">Revenue and payment figures will appear here once subscription payment recording is built.</p>
+        <section aria-label="Revenue" className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          {([
+            ["Revenue received", pkr(rev.verifiedTotal), "Verified payments only"],
+            ["Pending payments", `${rev.pendingCount} (${pkr(rev.pendingTotal)})`, "Recorded, not yet verified"],
+            ["Monthly recurring revenue", pkr(rev.mrr), "Estimate from plan prices"],
+            ["Annual recurring revenue", pkr(rev.arr), "MRR x 12"],
+          ] as const).map(([label, value, note]) => (
+            <div key={label} className="rounded-xl border border-slate-200 bg-white p-5">
+              <p className="text-sm text-slate-500">{label}</p>
+              <p className="mt-1 text-xl font-semibold text-slate-900">{value}</p>
+              <p className="mt-1 text-xs text-slate-400">{note}</p>
+            </div>
+          ))}
+        </section>
 
         <section className="rounded-xl border border-slate-200 bg-white">
           <h2 className="border-b border-slate-200 px-6 py-4 text-base font-semibold text-slate-900">Recent institutes</h2>
