@@ -151,6 +151,7 @@ export const subscriptions = pgTable("subscriptions", {
 export const subscriptionPayments = pgTable("subscription_payments", {
   id: id(),
   subscriptionId: text("subscription_id").notNull().references(() => subscriptions.id, { onDelete: "restrict" }),
+  planId: text("plan_id").notNull().references(() => subscriptionPlans.id, { onDelete: "restrict" }),
   institutionId: text("institution_id").notNull(),
   amount: money("amount"),
   currency: text("currency").notNull().default("PKR"),

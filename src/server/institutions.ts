@@ -6,19 +6,12 @@ import { requirePermission, type Actor } from "@/lib/rbac";
 import { computeExpiry } from "@/lib/subscription";
 import { generateTemporaryPassword } from "@/lib/tokens";
 import { SLUG_RE, normalizePkPhone } from "@/lib/validation";
+import { isUniqueViolation } from "./errors";
 import { DuplicateError } from "./tenant";
 import { normalizeEmail, type RequestMeta } from "./auth";
 
 const TRIAL_DAYS = 14;
 
-/** Postgres unique violation (23505). Drizzle wraps driver errors, so inspect the whole cause chain. */
-function isUniqueViolation(e: unknown): boolean {
-  for (let cur: unknown = e, depth = 0; cur && typeof cur === "object" && depth < 5; depth++) {
-    if ((cur as { code?: string }).code === "23505") return true;
-    cur = (cur as { cause?: unknown }).cause;
-  }
-  return false;
-}
 
 const registerInput = z.object({
   name: z.string().trim().min(2).max(150),
